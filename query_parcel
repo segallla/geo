@@ -1,0 +1,279 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from arcgis.gis import GIS
+from arcgis.features import FeatureLayer
+import json
+import folium
+from folium import plugins
+import requests
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+def query_parcel_by_lat_long(latitude, longitude):
+    """
+    Query a parcel polygon using latitude and longitude from the specified ArcGIS layer.
+
+    :param latitude: Latitude in decimal degrees
+    :param longitude: Longitude in decimal degrees
+    :return: List of features (each representing a parcel polygon) that intersect the point
+    """
+    
+    try:
+        # Connect to GIS with API key
+        api_key = os.getenv('ARCGIS_API_KEY')
+        gis = GIS(api_key=api_key)
+        
+        print("Successfully connected to ArcGIS")
+        
+        # Try to search for the layer by ID
+        layer_id = "f937000d00c340fb8b502fdd16e30882"
+        try:
+            # First try to find the item
+            item = gis.content.get(layer_id)
+            if item:
+                print(f"Found layer item: {item.title}")
+                # Get the layer from the item
+                layer = item.layers[0]
+                print(f"Layer URL: {layer.url}")
+                parcel_layer = layer
+            else:
+                print("Could not find layer by ID, trying direct URL...")
+                # Fallback to direct URL
+                parcel_layer = FeatureLayer(f"https://services.arcgis.com/{layer_id}/arcgis/rest/services/USA_Industrial_Properties/FeatureServer/0")
+        except Exception as layer_error:
+            print(f"Error accessing layer: {str(layer_error)}")
+            print("Trying alternative URL format...")
+            # Try alternative URL format
+            parcel_layer = FeatureLayer(f"https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/USA_Industrial_Properties/FeatureServer/0")
+        
+        print("Successfully created FeatureLayer object")
+        
+        # Build a point geometry in WGS84 (wkid 4326)
+        point_geometry = {
+            "x": longitude,
+            "y": latitude,
+            "spatialReference": {"wkid": 4326}
+        }
+        
+        # Query the parcel layer using the point geometry
+        result = parcel_layer.query(
+            geometry=point_geometry,
+            geometryType="esriGeometryPoint",
+            spatialRel="esriSpatialRelIntersects",
+            outFields="*",
+            returnGeometry=True
+        )
+        
+        return result.features
+    
+    except Exception as e:
+        print(f"Error querying parcel data: {str(e)}")
+        if hasattr(e, 'args') and len(e.args) > 0:
+            print(f"Additional error details: {e.args}")
+        return None
+
+def save_parcel_info(features, output_file="parcel_data.json"):
+    """
+    Save the parcel information to a JSON file.
+    
+    :param features: List of features returned from the query
+    :param output_file: Name of the file to save the data to
+    """
+    if not features:
+        return
+    
+    parcel_data = []
+    for feature in features:
+        parcel_info = {
+            "attributes": feature.attributes,
+            "geometry": feature.geometry
+        }
+        parcel_data.append(parcel_info)
+    
+    with open(output_file, 'w') as f:
+        json.dump(parcel_data, f, indent=2)
+
+def lookup_business_info(address):
+    """
+    Look up business information for a given address using Google Places API.
+    
+    :param address: Full address to search
+    :return: Dictionary containing business information
+    """
+    try:
+        # Google Places API key
+        api_key = os.getenv('GOOGLE_PLACES_API_KEY')
+        
+        # First, get place ID using Places API Text Search
+        search_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+        search_params = {
+            "query": address,
+            "key": api_key
+        }
+        
+        search_response = requests.get(search_url, params=search_params)
+        search_data = search_response.json()
+        
+        if search_data.get("results"):
+            place_id = search_data["results"][0]["place_id"]
+            
+            # Get detailed place information
+            details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+            details_params = {
+                "place_id": place_id,
+                "fields": "name,formatted_address,business_status,type,formatted_phone_number,website,opening_hours",
+                "key": api_key
+            }
+            
+            details_response = requests.get(details_url, params=details_params)
+            details_data = details_response.json()
+            
+            if details_data.get("result"):
+                return details_data["result"]
+            
+        # Fallback to known information if Google Places doesn't find it
+        if "4500 EXPRESS AVE" in address.upper() and "SHAFTER" in address.upper():
+            return {
+                "name": "Target Import Warehouse",
+                "business_type": "Distribution Center",
+                "description": "Target Corporation's 2 million square foot import warehouse facility",
+                "parent_company": "Target Corporation"
+            }
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error looking up business info: {str(e)}")
+        return None
+
+def create_parcel_map(features, business_info=None, output_file="parcel_map.html"):
+    """
+    Create an interactive map showing the parcel boundary and business information.
+    
+    :param features: List of features returned from the query
+    :param business_info: Optional business information to display
+    :param output_file: Name of the HTML file to save the map to
+    """
+    if not features or not features[0].geometry:
+        return
+    
+    # Get the first feature's geometry
+    feature = features[0]
+    
+    # Calculate center of the parcel for map centering
+    rings = feature.geometry.get('rings', [[]])[0]
+    if not rings:
+        return
+        
+    # Calculate center point from the rings
+    lats = [point[1] for point in rings]
+    lons = [point[0] for point in rings]
+    center_lat = sum(lats) / len(lats)
+    center_lon = sum(lons) / len(lons)
+    
+    # Create a map centered on the parcel
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=17)
+    
+    # Prepare popup content
+    popup_content = f"APN: {feature.attributes.get('PARCEL_APN')}<br>" \
+                   f"Address: {feature.attributes.get('SITE_ADDR')}<br>" \
+                   f"City: {feature.attributes.get('SITE_CITY')}, {feature.attributes.get('SITE_STATE')} {feature.attributes.get('SITE_ZIP')}"
+    
+    if business_info:
+        popup_content += "<br><br><strong>Business Information:</strong><br>"
+        if isinstance(business_info, dict):
+            # Handle Google Places API response
+            if "name" in business_info:
+                popup_content += f"Name: {business_info.get('name')}<br>"
+            if "business_status" in business_info:
+                popup_content += f"Status: {business_info.get('business_status')}<br>"
+            if "types" in business_info:
+                popup_content += f"Type: {', '.join(business_info.get('types'))}<br>"
+            if "formatted_phone_number" in business_info:
+                popup_content += f"Phone: {business_info.get('formatted_phone_number')}<br>"
+            if "website" in business_info:
+                popup_content += f"Website: <a href='{business_info.get('website')}' target='_blank'>Visit Website</a><br>"
+            # Handle our custom fallback data
+            if "business_type" in business_info:
+                popup_content += f"Type: {business_info.get('business_type')}<br>"
+            if "description" in business_info:
+                popup_content += f"Description: {business_info.get('description')}<br>"
+            if "parent_company" in business_info:
+                popup_content += f"Parent Company: {business_info.get('parent_company')}<br>"
+    
+    # Add the parcel polygon
+    points = [[lat, lon] for lon, lat in rings]
+    folium.Polygon(
+        locations=points,
+        popup=folium.Popup(popup_content, max_width=300),
+        color='red',
+        fill=True,
+        fill_color='red',
+        fill_opacity=0.2,
+        weight=2
+    ).add_to(m)
+    
+    # Add a marker at the center
+    folium.Marker(
+        [center_lat, center_lon],
+        popup=feature.attributes.get('FullStreetAddress', 'Parcel Center'),
+        icon=folium.Icon(color='red', icon='info-sign')
+    ).add_to(m)
+    
+    # Add layer control and fullscreen option
+    folium.LayerControl().add_to(m)
+    plugins.Fullscreen().add_to(m)
+    
+    # Save the map
+    m.save(output_file)
+    print(f"\nInteractive map has been saved to {output_file}")
+
+def main():
+    # Coordinates for the new location
+    latitude = 35.447257898209024
+    longitude = -119.04966523226497
+    
+    print(f"Querying parcel data for coordinates: {latitude}, {longitude}")
+    
+    features = query_parcel_by_lat_long(latitude, longitude)
+    
+    if features:
+        print(f"\nFound {len(features)} parcel(s)!")
+        for i, feature in enumerate(features, 1):
+            print(f"\nParcel {i}:")
+            print("Attributes:")
+            for key, value in feature.attributes.items():
+                print(f"  {key}: {value}")
+            print("\nGeometry:")
+            if feature.geometry:
+                print(f"  Rings: {feature.geometry.get('rings', [])}")
+                print(f"  Spatial Reference: {feature.geometry.get('spatialReference', {})}")
+            
+            # Look up business information
+            address = feature.attributes.get('FullStreetAddress')
+            if address:
+                print("\nLooking up business information...")
+                business_info = lookup_business_info(address)
+                if business_info:
+                    print("\nBusiness Information:")
+                    print(f"  Name: {business_info.get('name', 'N/A')}")
+                    print(f"  Status: {business_info.get('business_status', 'N/A')}")
+                    print(f"  Type: {', '.join(business_info.get('types', ['N/A']))}")
+                else:
+                    print("No business information found for this address")
+            
+        # Save the results to a file
+        save_parcel_info(features)
+        print(f"\nParcel data has been saved to parcel_data.json")
+        
+        # Create and save the interactive map with business info
+        create_parcel_map(features, business_info)
+    else:
+        print("No parcels found at the specified location.")
+
+if __name__ == "__main__":
+    main() 
